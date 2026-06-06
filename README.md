@@ -20,7 +20,8 @@ then asks whether green space, and the cooling it provides, is distributed equit
 - The least-green neighborhoods run 4–7°C hotter than the greenest ones.
 - Green space is not equitably distributed: in several cities, lower-income
   neighborhoods have both less vegetation and higher temperatures.
-- ![NDVI vs LST by city](figure_ndvi_lst.png) 
+  
+![NDVI vs LST by city](figure_ndvi_lst.png) 
 
 ## Data
 
