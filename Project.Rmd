@@ -1,0 +1,284 @@
+---
+title: "Text Analysis and Spatial Data for Economists"
+subtitle: "Urban Green Space and Urban Heat: Multi-City Spatial Analysis"
+author: LEONARDO GRAVELLONE
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+  html_document:
+  highlight: tango
+  df_print: kable
+  toc: true
+  toc_float: true
+  number_sections: true
+toc_collapsed: true
+ 
+---
+
+
+```{r setup, include=F , message = F}
+library(dplyr)
+library(terra)
+library(exactextractr)
+library(sf)
+library(raster)
+library(ggplot2) 
+library(tigris)
+library(tidycensus)
+options(tigris_use_cache = TRUE, tigris_class = "sf")
+options(readr.show_progress = FALSE)
+options(dplyr.show_progress = FALSE)
+options(terra.progress = 0)
+```
+
+# *1. Downloading and loading all the necessary data*
+```{r load_data, message=FALSE, warning=FALSE}
+cities <- tibble::tibble(
+  city = c("New York", "Los Angeles", "Chicago", "Houston", "Phoenix",
+           "Philadelphia", "San Antonio", "San Diego", "Dallas", "San Jose"),
+  state = c("NY", "CA", "IL", "TX", "AZ", "PA", "TX", "CA", "TX", "CA"),
+  county_fips = c("061", "037", "031", "201", "013", "101", "029", "073", "113", "085")
+)
+tract_list <- list()
+for (i in seq_len(nrow(cities))) {
+  message("Downloading: ", cities$city[i])
+  
+  tracts_i <- tracts(state = cities$state[i],
+                     county = cities$county_fips[i],
+                     year = 2020,
+                     cb = TRUE) |>
+    st_transform(4326) |>           
+    mutate(city = cities$city[i])     
+  
+  tract_list[[cities$city[i]]] <- tracts_i
+}
+all_tracts <- do.call(rbind, tract_list)
+```
+
+# *2. Preprocessing data*
+
+```{r preproc_data, message=FALSE, warning=FALSE, results='hide'}
+tracts <- st_read("data/us_10city_tracts_2020.geojson")
+cities <- unique(tracts$city)
+dir.create("data/processed", recursive = TRUE, showWarnings = FALSE)
+tracts$city <- gsub(" ", "", tracts$city)
+
+
+for (city in unique(tracts$city)) {
+  message("Processing: ", city)
+  
+  city_tracts <- tracts %>% filter(city == !!city)
+  ndvi_path <- paste0("data/gee_exports/", city, "_NDVI.tif")
+  lst_path  <- paste0("data/gee_exports/", city, "_LST.tif")
+  
+  if (!file.exists(ndvi_path) | !file.exists(lst_path)) {
+    warning("Skipping ", city, ": NDVI or LST file missing")
+    next
+  }
+  ndvi <- rast(ndvi_path)
+  lst  <- rast(lst_path)
+  ndvi <- project(ndvi, crs(city_tracts))
+  lst  <- project(lst, crs(city_tracts))
+  ndvi_crop <- crop(ndvi, city_tracts)
+  lst_crop  <- crop(lst, city_tracts)
+  ndvi_mask <- mask(ndvi_crop, vect(city_tracts))
+  lst_mask  <- mask(lst_crop, vect(city_tracts))
+  writeRaster(ndvi_mask,
+              filename = paste0("data/processed/", city, "_NDVI_masked.tif"),
+              overwrite = TRUE)
+  
+  writeRaster(lst_mask,
+              filename = paste0("data/processed/", city, "_LST_masked.tif"),
+              overwrite = TRUE)
+  
+  message("Done: ", city)
+}
+```
+
+# *3. Extract NDVI & LST per Census Tract*
+
+```{r extract_data, message=FALSE, warning=FALSE, results='hide'}
+tracts <- st_read("data/us_10city_tracts_2020.geojson")
+tracts$city <- gsub(" ", "", tracts$city)
+cities <- unique(tracts$city)
+results <- list()
+
+for (city in cities) {
+  city_tracts <- tracts %>% filter(city == !!city)
+  ndvi_file <- paste0("data/processed/", city, "_NDVI_masked.tif")
+  lst_file  <- paste0("data/processed/", city, "_LST_masked.tif")
+  
+  if (!file.exists(ndvi_file) | !file.exists(lst_file)) {
+    next
+  }
+  ndvi <- rast(ndvi_file)
+  lst  <- rast(lst_file)
+  city_tracts$mean_ndvi <- exact_extract(ndvi, city_tracts, 'mean')
+  city_tracts$mean_lst  <- exact_extract(lst,  city_tracts, 'mean')
+  results[[city]] <- city_tracts
+}
+
+zonal_stats <- do.call(rbind, results)
+
+st_write(zonal_stats, "data/ndvi_lst_by_tract.geojson", delete_dsn = TRUE)
+write.csv(st_drop_geometry(zonal_stats), "data/ndvi_lst_by_tract.csv", row.names = FALSE)
+```
+## *4. Correlation Table*
+```{r sum_table, message=FALSE, warning=FALSE}
+zonal <- read.csv("data/ndvi_lst_by_tract.csv")
+results <- list()
+zonal$city <- gsub(" ", "", zonal$city)
+
+for (city in unique(zonal$city)) {
+  df <- zonal %>% filter(city == !!city) %>%
+    filter(!is.na(mean_ndvi), !is.na(mean_lst))
+  if (nrow(df) < 50) next
+  cor_val <- cor(df$mean_ndvi, df$mean_lst)
+  model <- lm(mean_lst ~ mean_ndvi, data = df)
+  slope <- coef(model)[["mean_ndvi"]]
+  r2 <- summary(model)$r.squared
+  results[[city]] <- data.frame(
+    city = city,
+    correlation = round(cor_val, 3),
+    slope = round(slope, 2),
+    r_squared = round(r2, 3),
+    n_tracts = nrow(df)
+  )
+}
+summary_table <- do.call(rbind, results)
+summary_table <- summary_table[order(-summary_table$r_squared), ]
+
+knitr::kable(summary_table, digits = 3,
+             col.names = c("City", "Correlation", "Slope (°C/NDVI)", "R²", "Number of Tracts"),
+             caption = "Summary of NDVI–LST Relationship by City")
+write.csv(summary_table, "data/ndvi_lst_summary_by_city.csv", row.names = FALSE)
+```
+## *5. Correlation Plot by City*
+```{r cor_plot, message=FALSE, warning=FALSE}
+
+zonal <- read.csv("data/ndvi_lst_by_tract.csv")
+zonal$city <- gsub(" ", "", zonal$city)
+
+zonal_filtered <- zonal %>%
+  filter(!is.na(mean_ndvi), !is.na(mean_lst))
+
+ggplot(zonal_filtered, aes(x = mean_ndvi, y = mean_lst)) +
+  geom_point(alpha = 0.5, size = 0.8, color = "black") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ city, scales = "free_y") +
+  labs(title = "NDVI vs. LST by City",
+       x = "Mean NDVI",
+       y = "Mean LST (°C)") +
+  theme_minimal(base_size = 10)
+```
+
+
+## *6. Cooling effect and R^2 Plot*
+```{r plot, message=FALSE, warning=FALSE}
+summary_table <- read.csv("data/ndvi_lst_summary_by_city.csv")
+
+ggplot(summary_table, aes(x = reorder(city, slope), y = slope)) +
+  geom_col(fill = "#3a8d63") +
+  coord_flip() +
+  labs(title = "Cooling Effect of NDVI (Slope)", x = "City", y = "Slope (°C per +1 NDVI)") +
+  theme_minimal()
+
+ggplot(summary_table, aes(x = reorder(city, r_squared), y = r_squared)) +
+  geom_col(fill = "#4682b4") +
+  coord_flip() +
+  labs(title = "R²: Variation in LST Explained by NDVI", x = "City", y = "R²") +
+  theme_minimal()
+```
+
+
+## *7. Top and Bottom Decile Difference Table*
+``` {r dec_table, message=FALSE, warning=FALSE}
+zonal <- read.csv("data/ndvi_lst_by_tract.csv")
+zonal$city <- gsub(" ", "", zonal$city)
+
+quartile_summary <- zonal %>%
+  filter(!is.na(mean_ndvi), !is.na(mean_lst)) %>%
+  group_by(city) %>%
+  mutate(ndvi_qtile = ntile(mean_ndvi, 10)) %>%
+  summarise(
+    mean_lst_top10 = mean(mean_lst[ndvi_qtile == 10]),
+    mean_lst_bottom10 = mean(mean_lst[ndvi_qtile == 1]),
+    lst_diff = mean_lst_bottom10 - mean_lst_top10,
+    .groups = "drop"
+  ) %>%
+  arrange(desc(lst_diff))
+
+knitr::kable(quartile_summary, digits = 2, caption = "Temperature Difference: Bottom vs. Top 10% NDVI Tracts")
+```
+
+# Census Analysis
+
+*NOTE* 
+*To load the needed data, I've used this API key from the US Census Bureau: "census_api_key("ac082ac1a88527ca0092581d65b3a01ae9967027", install = TRUE, overwrite = TRUE)"*
+
+# *8. Dowloading and loading census data*
+```{r cens_load, warning=FALSE, message=FALSE, results='hide'}
+
+states_needed <- c("NY", "CA", "IL", "TX", "AZ", "PA")
+
+income_data <- get_acs(geography = "tract",
+                       variables = "B19013_001",
+                       state = states_needed,
+                       year = 2020,
+                       geometry = FALSE,
+                       output = "wide")
+income_data <- income_data %>%
+  dplyr::select(GEOID, median_income = B19013_001E)
+
+zonal_stats <- read.csv("data/ndvi_lst_by_tract.csv")
+zonal_stats$GEOID <- as.character(zonal_stats$GEOID)
+zonal_income <- zonal_stats %>%
+  left_join(income_data, by = "GEOID")
+```
+
+# *9. Decile Comparison*
+```{r cens_dec_graph ,message=FALSE, warning=FALSE}
+quartiles <- zonal_income %>%
+  filter(!is.na(mean_ndvi), !is.na(mean_lst)) %>%
+  group_by(city) %>%
+  mutate(ndvi_decile = ntile(mean_ndvi, 10)) %>%
+  group_by(city, ndvi_decile) %>%
+  summarise(mean_lst = mean(mean_lst), .groups = "drop")
+
+ggplot(quartiles, aes(x = ndvi_decile, y = mean_lst)) +
+  geom_line(size = 1.2, color = "#3a8d63") + 
+  geom_point(size = 2, color = "#3a8d63") +
+  facet_wrap(~ city, scales = "free_y") +  # One plot per city
+  labs(title = "LST across NDVI Deciles per City",
+       subtitle = "How urban heat varies by green space",
+       x = "NDVI Decile (1 = Least Green, 10 = Most Green)",
+       y = "Mean LST (°C)") +
+  theme_minimal(base_size = 12) +
+  theme(strip.text = element_text(size = 14),  # Larger city names
+        axis.text = element_text(size = 10))
+```
+
+# *10. Income vs NDVI by city*
+```{r cens_corr, message=FALSE, warning=FALSE}
+ggplot(zonal_income %>% filter(!is.na(mean_ndvi), !is.na(median_income)),
+       aes(x = median_income, y = mean_ndvi)) +
+  geom_point(alpha = 0.5, size = 0.8) +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  facet_wrap(~ city, scales = "free_x") + 
+  labs(title = "Income vs NDVI by City",
+       x = "Median Household Income ($)",
+       y = "Mean NDVI") +
+  theme_minimal(base_size = 12)
+```
+
+
+**Note:** Median household income data were available for a subset of cities and tracts. The Income–NDVI analysis is therefore shown only for those cities with sufficient coverage.
+
+
+
+
+
+
+
+
+
+
